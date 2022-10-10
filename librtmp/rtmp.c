@@ -867,10 +867,15 @@ int RTMP_SetupURL(RTMP *r, char *url)
 }
 
 static int
-add_addr_info(struct sockaddr_in *service, AVal *host, int port)
+add_addr_info(struct sockaddr_storage *service, AVal *host, int port)
 {
+  struct addrinfo hint, *res, *p;
+  struct sockaddr_in *sin;
+	struct sockaddr_in6 *sin6;
   char *hostname;
+  char ip_address[INET6_ADDRSTRLEN];
   int ret = TRUE;
+
   if (host->av_val[host->av_len])
     {
       hostname = malloc(host->av_len+1);
@@ -882,20 +887,42 @@ add_addr_info(struct sockaddr_in *service, AVal *host, int port)
       hostname = host->av_val;
     }
 
-  service->sin_addr.s_addr = inet_addr(hostname);
-  if (service->sin_addr.s_addr == INADDR_NONE)
-    {
-      struct hostent *host = gethostbyname(hostname);
-      if (host == NULL || host->h_addr == NULL)
-	{
-	  RTMP_Log(RTMP_LOGERROR, "Problem accessing the DNS. (addr: %s)", hostname);
-	  ret = FALSE;
-	  goto finish;
-	}
-      service->sin_addr = *(struct in_addr *)host->h_addr;
-    }
+  ret = getaddrinfo(hostname, "http", &hint, &res);
+  if (ret != 0) {
+    RTMP_Log(RTMP_LOGERROR, "Call getaddrinfo return %d\n", ret);
+    ret = FALSE;
+    goto finish;
+  }
 
-  service->sin_port = htons(port);
+  ret = TRUE;
+
+  for(p = res; p != NULL; p = p->ai_next)
+   {
+    if (p->ai_family == AF_INET) {
+      void* addr = &(((struct sockaddr_in *)p->ai_addr)->sin_addr);
+      inet_ntop(p->ai_family, addr, ip_address, sizeof ip_address);
+      RTMP_Log(RTMP_LOGDEBUG, "%s, Getaddrinfo v4 with hostname %s", __FUNCTION__, ip_address);
+      sin = (struct sockaddr_in *)service;
+      sin->sin_port = htons(port);
+      sin->sin_family = AF_INET;
+      inet_pton(p->ai_family, ip_address, &sin->sin_addr);
+      break;
+    } else if (p->ai_family == AF_INET6) {
+      void* addr = &(((struct sockaddr_in6 *)p->ai_addr)->sin6_addr);
+      inet_ntop(p->ai_family, addr, ip_address, sizeof ip_address);
+      RTMP_Log(RTMP_LOGDEBUG, "%s, Getaddrinfo v6 with hostname %s", __FUNCTION__, ip_address);
+      sin6 = (struct sockaddr_in6 *)service;
+      sin6->sin6_port = htons(port);
+      sin6->sin6_family = AF_INET6;
+      inet_pton(p->ai_family, ip_address, &sin6->sin6_addr);
+      break;
+    } else {
+	    RTMP_Log(RTMP_LOGERROR, "Problem access the DNS. (addr: %s)", hostname);
+	    ret = FALSE;
+	    goto finish;
+    }
+  }
+
 finish:
   if (hostname != host->av_val)
     free(hostname);
@@ -903,35 +930,42 @@ finish:
 }
 
 int
-RTMP_Connect0(RTMP *r, struct sockaddr * service)
+RTMP_Connect0(RTMP *r, struct sockaddr_storage* service)
 {
   int on = 1;
   r->m_sb.sb_timedout = FALSE;
   r->m_pausing = 0;
   r->m_fDuration = 0.0;
 
-  r->m_sb.sb_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  r->m_sb.sb_socket = socket(service->ss_family, SOCK_STREAM, IPPROTO_TCP);
   if (r->m_sb.sb_socket != -1)
     {
-      if (connect(r->m_sb.sb_socket, service, sizeof(struct sockaddr)) < 0)
-	{
-	  int err = GetSockError();
-	  RTMP_Log(RTMP_LOGERROR, "%s, failed to connect socket. %d (%s)",
-	      __FUNCTION__, err, strerror(err));
-	  RTMP_Close(r);
-	  return FALSE;
-	}
+      int addrlen = 0;
+      if (service->ss_family == AF_INET) {
+        addrlen = sizeof(struct sockaddr_in);
+      } else if (service->ss_family == AF_INET6) {
+        addrlen = sizeof(struct sockaddr_in6);
+      }
+      if (connect(r->m_sb.sb_socket, service, addrlen) < 0)
+      {
+        int err = GetSockError();
+        RTMP_Log(RTMP_LOGERROR, "%s, failed to connect socket. %d (%s)",
+            __FUNCTION__, err, strerror(err));
+        RTMP_Close(r);
+        return FALSE;
+      }
+      RTMP_Log(RTMP_LOGDEBUG, "%s Connect successfully", __FUNCTION__);
 
       if (r->Link.socksport)
-	{
-	  RTMP_Log(RTMP_LOGDEBUG, "%s ... SOCKS negotiation", __FUNCTION__);
-	  if (!SocksNegotiate(r))
-	    {
-	      RTMP_Log(RTMP_LOGERROR, "%s, SOCKS negotiation failed.", __FUNCTION__);
-	      RTMP_Close(r);
-	      return FALSE;
-	    }
-	}
+      {
+        RTMP_Log(RTMP_LOGDEBUG, "%s ... SOCKS negotiation", __FUNCTION__);
+        if (!SocksNegotiate(r))
+          {
+            RTMP_Log(RTMP_LOGERROR, "%s, SOCKS negotiation failed.", __FUNCTION__);
+            RTMP_Close(r);
+            return FALSE;
+          }
+      }
     }
   else
     {
@@ -1030,27 +1064,26 @@ RTMP_Connect1(RTMP *r, RTMPPacket *cp)
 int
 RTMP_Connect(RTMP *r, RTMPPacket *cp)
 {
-  struct sockaddr_in service;
+  struct sockaddr_storage service;
   if (!r->Link.hostname.av_len)
     return FALSE;
 
-  memset(&service, 0, sizeof(struct sockaddr_in));
-  service.sin_family = AF_INET;
+  memset(&service, 0, sizeof(struct sockaddr_storage));
 
   if (r->Link.socksport)
     {
       /* Connect via SOCKS */
       if (!add_addr_info(&service, &r->Link.sockshost, r->Link.socksport))
-	return FALSE;
+	      return FALSE;
     }
   else
     {
       /* Connect directly */
       if (!add_addr_info(&service, &r->Link.hostname, r->Link.port))
-	return FALSE;
+	      return FALSE;
     }
 
-  if (!RTMP_Connect0(r, (struct sockaddr *)&service))
+  if (!RTMP_Connect0(r, &service))
     return FALSE;
 
   r->m_bSendCounter = TRUE;
@@ -1062,11 +1095,11 @@ static int
 SocksNegotiate(RTMP *r)
 {
   unsigned long addr;
-  struct sockaddr_in service;
+  struct sockaddr_storage service;
   memset(&service, 0, sizeof(struct sockaddr_in));
 
   add_addr_info(&service, &r->Link.hostname, r->Link.port);
-  addr = htonl(service.sin_addr.s_addr);
+  addr = htonl(((struct sockaddr_in*)(&service))->sin_addr.s_addr);
 
   {
     char packet[] = {
